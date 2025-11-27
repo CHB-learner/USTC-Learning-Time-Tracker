@@ -21,22 +21,34 @@ driver = webdriver.Chrome(options=options)
 wait = WebDriverWait(driver, 20)
 
 
-def parse_time_to_seconds(text: str) -> int:
+def parse_learned_seconds_from_row(row_text: str) -> int:
     """
-    从给定文本中解析时间：优先匹配 hh:mm:ss，其次 mm:ss
-    返回秒数，不匹配则返回 0
+    从列表行文本中解析 '已学习：00:04:45 / 00:05:00' 里的已学习时间（秒）
     """
-    m = re.search(r"(\d{2}:\d{2}:\d{2})", text)
-    if m:
-        h, mi, s = map(int, m.group(1).split(":"))
+    # 支持：已学习: 00:04:45 / 00:05:00 或 已学习00:04:45/00:05:00
+    m = re.search(r"已学习[：:\s]*([\d]{2}:[\d]{2}:[\d]{2})", row_text)
+    if not m:
+        return 0
+    t = m.group(1)
+    h, mi, s = map(int, t.split(":"))
+    return h * 3600 + mi * 60 + s
+
+
+def parse_required_seconds_from_row(row_text: str) -> int:
+    """
+    从行文本里解析 '/ 00:05:00' 或 '/ 00:04:00' 的总要求时间（秒）
+    """
+    m = re.search(r"/\s*([\d]{2}:[\d]{2}:[\d]{2}|[\d]{2}:[\d]{2})", row_text)
+    if not m:
+        return 0
+    t = m.group(1)
+    parts = list(map(int, t.split(":")))
+    if len(parts) == 3:
+        h, mi, s = parts
         return h * 3600 + mi * 60 + s
-
-    m = re.search(r"(\d{2}:\d{2})", text)
-    if m:
-        mi, s = map(int, m.group(1).split(":"))
+    else:
+        mi, s = parts
         return mi * 60 + s
-
-    return 0
 
 
 def keep_active(total_seconds: int):
@@ -72,54 +84,6 @@ def wait_for_course_table():
     time.sleep(1)
 
 
-def get_required_seconds_from_detail() -> int:
-    """
-    在学习详情页中，从“要求学习”区域提取时间（秒）
-    只抓『要求学习』后面最近的时间，不去管上面的必学时长 00:31:00
-    """
-    # 找到“要求学习”四个字
-    label = wait.until(
-        EC.presence_of_element_located(
-            (By.XPATH, "//*[contains(text(),'要求学习')]")
-        )
-    )
-
-    # 找一个稍大的包含块（祖先），但只用文本里“要求学习”后面的时间
-    try:
-        block = label.find_element(By.XPATH, "ancestor::*[contains(., '要求学习')][1]")
-        text = block.text.replace("\n", " ")
-    except Exception:
-        text = label.text.replace("\n", " ")
-
-    # 重点：只匹配“要求学习”后面的时间（支持 mm:ss 或 hh:mm:ss）
-    # 示例："... 已学习 00:21 要求学习 05:00"
-    m = re.search(r"要求学习[^\d]*(\d{2}:\d{2}(?::\d{2})?)", text)
-    if m:
-        t = m.group(1)
-        parts = list(map(int, t.split(":")))
-        if len(parts) == 3:
-            h, mi, s = parts
-            return h * 3600 + mi * 60 + s
-        elif len(parts) == 2:
-            mi, s = parts
-            return mi * 60 + s
-
-    # 兜底：还是没找到，就用整个页面再扫一遍（一般用不到）
-    full_text = driver.find_element(By.TAG_NAME, "body").text.replace("\n", " ")
-    m2 = re.search(r"要求学习[^\d]*(\d{2}:\d{2}(?::\d{2})?)", full_text)
-    if m2:
-        t = m2.group(1)
-        parts = list(map(int, t.split(":")))
-        if len(parts) == 3:
-            h, mi, s = parts
-            return h * 3600 + mi * 60 + s
-        elif len(parts) == 2:
-            mi, s = parts
-            return mi * 60 + s
-
-    return 0
-
-
 def auto_study_current_page():
     """
     自动学习当前页面上的所有“去学习”课程
@@ -147,41 +111,51 @@ def auto_study_current_page():
         print(f"\n===== 第 {i+1} 门课程开始学习 =====")
         print(f"行内容：{row_text}")
 
-        # 点击“去学习”
+        # 从列表行里解析已学习时间 / 总要求时间（秒）
+        learned = parse_learned_seconds_from_row(row_text)
+        required = parse_required_seconds_from_row(row_text)
+        print(f"已学习时间：{learned} 秒，行内总要求时间：{required} 秒")
+
+        if required <= 0:
+            # 行里都没写要求时间，那就用 300 秒兜底
+            base_required = 300
+            remaining = max(base_required - learned, 60)
+            print("⚠ 行内未解析到总要求时间，按 300 秒兜底。")
+        else:
+            remaining = max(required - learned, 0)
+
+        # 如果已经够时长了，直接跳过，不点“去学习”
+        if remaining <= 0:
+            print("✅ 已学习时间已达到或超过要求，跳过挂机。")
+            # 直接处理下一门课（此时仍在列表页）
+            print("===== 本门课程结束（已学够），留在列表页 =====\n")
+            continue
+
+        need_seconds = remaining + BUFFER_SECONDS
+        print(f"剩余需学习时间：{remaining} 秒，实际挂机：{need_seconds} 秒。")
+
+        # 进入学习详情页
         learn_btn.click()
 
-        # 等学习详情页加载出来（中间那篇文章 + 右侧进度）
+        # 等学习详情页加载出来（中间文章 + 右侧进度）
         try:
             wait.until(
                 EC.presence_of_element_located(
-                    (By.XPATH, "//*[contains(text(),'已学习') or contains(text(),'学习时长')]")
+                    (By.XPATH, "//*[contains(text(),'已学习') or contains(text(),'学习时长') or contains(text(),'要求学习')]")
                 )
             )
         except Exception:
             print("学习详情页等待超时，再等几秒。")
             time.sleep(5)
 
-        # 从右侧“要求学习”区域获取总时间
-        required = get_required_seconds_from_detail()
-        if required <= 0:
-            print("⚠ 没能解析到要求学习时间，默认挂 60 秒。")
-            need_seconds = 60
-        else:
-            need_seconds = required + BUFFER_SECONDS
-
-        print(f"解析到要求学习时间：{required} 秒，实际挂机：{need_seconds} 秒。")
-
         # 挂机
         keep_active(need_seconds)
 
+        # 挂机结束，回到课程列表页
         print("本门课程学习时间已到，返回课程列表……")
-
-        # 不再点“返回”也不后退，直接重新打开任务页面
         driver.get(EXAM_URL)
         wait_for_course_table()
-
         print("===== 本门课程结束，返回列表 =====\n")
-
 
 
 def main():
